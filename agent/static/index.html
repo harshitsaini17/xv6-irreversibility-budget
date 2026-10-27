@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>xv6 Agent Dashboard</title>
+<style>
+  :root { --bg:#0f141c; --panel:#161d28; --line:#263142; --fg:#d8e0ec; --mut:#8492a6; --acc:#5b9cf0; --ok:#3fb27f; --bad:#e06c6c; --warn:#d9a441; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg); height:100vh; display:flex; flex-direction:column; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  header, header select, header button { font-size:13px; }
+  header h1 { font-size:16px; margin:0 12px 0 0; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; background:var(--bad); margin-right:6px; }
+  .dot.on { background:var(--ok); }
+  select, button, input { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 10px; font-size:13px; }
+  button { cursor:pointer; } button:hover { border-color:var(--acc); }
+  main { flex:1; display:grid; grid-template-columns: 1fr 1fr; gap:0; min-height:0; }
+  section { display:flex; flex-direction:column; min-height:0; border-right:1px solid var(--line); }
+  section h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); margin:0; padding:8px 14px; border-bottom:1px solid var(--line); }
+  #chat { flex:1; overflow:auto; padding:12px 14px; }
+  .msg { margin:0 0 12px 0; max-width:95%; }
+  .user { color:var(--acc); font-weight:600; }
+  .bot pre, .step pre { white-space:pre-wrap; word-break:break-word; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px; margin:4px 0; font-size:12.5px; }
+  .step { border-left:3px solid var(--line); padding-left:8px; margin:4px 0 4px 6px; font-size:12px; color:var(--mut); }
+  .step.ok { border-color:var(--ok); } .step.rejected { border-color:var(--warn); } .step.error { border-color:var(--bad); }
+  .step code { color:var(--fg); }
+  form { display:flex; gap:8px; padding:10px 14px; border-top:1px solid var(--line); }
+  form input { flex:1; }
+  #console { flex:1; overflow:auto; margin:0; padding:12px 14px; font: 12.5px/1.35 ui-monospace, monospace; white-space:pre-wrap; color:#b8f0c4; background:#0a0e14; }
+  .chips { padding:6px 14px; display:flex; gap:6px; flex-wrap:wrap; border-top:1px solid var(--line); }
+  .chips button { font-size:12px; padding:3px 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>xv6 Agent</h1>
+  <span><span id="dot" class="dot"></span><span id="state">stopped</span></span>
+  <label>Planner
+    <select id="mode"><option value="llm">LLM (kiro-gateway)</option><option value="rules">Rules (no LLM)</option></select>
+  </label>
+  <label>Model
+    <select id="model">
+      <option>claude-sonnet-5.5</option><option>claude-haiku-5.5</option>
+      <option>claude-opus-5.5</option>
+    </select>
+  </label>
+  <button id="reset">New chat</button>
+</header>
+<main>
+  <section>
+    <h2>Chat · agent trace</h2>
+    <div id="chat"></div>
+    <div class="chips">
+      <button data-q="boot xv6 and list the files in /">boot + ls</button>
+      <button data-q="read README and summarize it in 2 lines">summarize README</button>
+      <button data-q="how many lines does README have?">wc README</button>
+      <button data-q="run the hello program">hello</button>
+    </div>
+    <form id="f"><input id="q" autocomplete="off" placeholder="Ask the agent… (rules mode: boot | ls / | cat README | run echo hi)"><button>Send</button></form>
+  </section>
+  <section>
+    <h2>xv6 console (raw QEMU serial)</h2>
+    <pre id="console"></pre>
+  </section>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const chat = $('#chat');
+function esc(s){ return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function add(html){ const d=document.createElement('div'); d.className='msg'; d.innerHTML=html; chat.appendChild(d); chat.scrollTop=chat.scrollHeight; return d; }
+
+async function send(text){
+  add(`<div class="user">you ▸ ${esc(text)}</div>`);
+  const wait = add(`<div class="step">thinking…</div>`);
+  const r = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({message:text, mode:$('#mode').value, model:$('#model').value})});
+  const j = await r.json();
+  let html = '';
+  for (const s of j.trace) {
+    html += `<div class="step ${s.verdict}">[${s.source}] <code>${esc(s.call.tool)}(${esc(JSON.stringify(s.call.args))})</code> → ${s.verdict} · ${s.ms} ms<pre>${esc(String(s.output).slice(-3000))}</pre></div>`;
+  }
+  html += `<div class="bot"><pre>${esc(j.reply || '')}</pre></div>`;
+  wait.innerHTML = html;
+  chat.scrollTop = chat.scrollHeight;
+}
+$('#f').onsubmit = e => { e.preventDefault(); const t=$('#q').value.trim(); if(t){ $('#q').value=''; send(t);} };
+document.querySelectorAll('.chips button').forEach(b => b.onclick = () => send(b.dataset.q));
+$('#reset').onclick = async () => { await fetch('/api/reset',{method:'POST'}); chat.innerHTML=''; };
+
+async function poll(){
+  try {
+    const j = await (await fetch('/api/status')).json();
+    $('#dot').className = 'dot' + (j.running ? ' on' : '');
+    $('#state').textContent = j.running ? 'xv6 running' : 'stopped';
+    const c = $('#console'); const atBottom = c.scrollTop + c.clientHeight >= c.scrollHeight - 20;
+    c.textContent = j.console; if (atBottom) c.scrollTop = c.scrollHeight;
+  } catch(e) {}
+  setTimeout(poll, 1000);
+}
+poll();
+(async () => {
+  const u = new URLSearchParams(location.search);
+  if (u.get('mode')) $('#mode').value = u.get('mode');
+  for (const q of u.getAll('q')) await send(q);
+})();
+</script>
+</body>
+</html>
