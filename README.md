@@ -21,7 +21,7 @@ LLM (kiro-gateway :8000)  ->  agent.py  ->  tools.py (validator)  ->  xv6_bridge
 ```
 
 Gateway key is read from `KIRO_API_KEY`, else from `/workspace/proxy/kiro-gateway/.env`.
-Model defaults to `claude-sonnet-4.5` (`AGENT_MODEL` to change). `CPUS=3 ./run.sh` for 3 harts.
+Model defaults to `claude-sonnet-5.5` (dashboard also offers `claude-haiku-5.5`, `claude-opus-5.5`) (`AGENT_MODEL` to change). `CPUS=3 ./run.sh` for 3 harts.
 
 Rules mode (no LLM): `boot`, `stop`, `status`, `ls /`, `cat README`, `run <cmd>`.
 

@@ -18,7 +18,7 @@ from tools import ToolExecutor, openai_tool_schema
 
 GATEWAY_URL = os.environ.get("KIRO_GATEWAY_URL", "http://localhost:8000/v1")
 GATEWAY_ENV = os.environ.get("KIRO_GATEWAY_ENV", "/workspace/proxy/kiro-gateway/.env")
-DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "claude-sonnet-4.5")
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "claude-sonnet-5.5")
 MAX_STEPS = 8
 
 SYSTEM_PROMPT = """You operate an xv6-riscv guest running in QEMU through tools.
