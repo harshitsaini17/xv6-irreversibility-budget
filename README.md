@@ -77,7 +77,7 @@ flowchart TB
         FS[(run.img<br/>fresh copy of fs.img)]
         SH -->|ecall / trap| K --> FS
     end
-    B -->|"stdin: cmd ; echo @@ENDn@@"| SH
+    B -->|"stdin: cmd #59; echo @@ENDn@@"| SH
     SH -->|"stdout: output until marker"| B
 ```
 
@@ -96,11 +96,11 @@ sequenceDiagram
     Agent->>LLM: messages + tool schema
     LLM-->>Agent: run_command({"command": "hello"})
     Agent->>Validator: validate_action()
-    Validator-->>Agent: ok (hello is allowlisted, no ; & ` $)
+    Validator-->>Agent: ok (hello is allowlisted, no #59; & ` $)
     Agent->>Bridge: run("hello")
-    Bridge->>xv6: hello ; echo @@END1@@⏎
+    Bridge->>xv6: hello #59; echo @@END1@@ + Enter
     xv6-->>Bridge: hello 1 2 3 4 / sum = 10 / @@END1@@
-    Bridge-->>Agent: "hello 1 2 3 4\nsum = 10"
+    Bridge-->>Agent: "hello 1 2 3 4 / sum = 10"
     Agent->>LLM: tool result
     LLM-->>Agent: "The sum is 10."
     Agent-->>User: reply + full trace
