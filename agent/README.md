@@ -4,7 +4,7 @@ Host-side Python agent that boots xv6-riscv in QEMU and runs commands on it,
 with a small chat dashboard. Kernel policy (the irreversibility budget) comes later.
 
 ```
-LLM (kiro-gateway :8000)  ->  agent.py  ->  tools.py (validator)  ->  xv6_bridge.py  ->  QEMU stdin/stdout  ->  xv6 sh
+LLM (OpenAI-compatible API)  ->  agent.py  ->  tools.py (validator)  ->  xv6_bridge.py  ->  QEMU stdin/stdout  ->  xv6 sh
 ```
 
 | File | Role |
@@ -20,7 +20,7 @@ LLM (kiro-gateway :8000)  ->  agent.py  ->  tools.py (validator)  ->  xv6_bridge
 ./run.sh            # builds xv6 if needed, starts the dashboard
 ```
 
-Gateway key is read from `KIRO_API_KEY`, else from `/workspace/proxy/kiro-gateway/.env`.
+LLM endpoint: `LLM_BASE_URL` (default `http://localhost:8000/v1`). Key: `LLM_API_KEY`, else read from a local kiro-gateway `.env`. See the top-level README.
 Model defaults to `claude-sonnet-5.5` (dashboard also offers `claude-haiku-5.5`, `claude-opus-5.5`) (`AGENT_MODEL` to change). `CPUS=3 ./run.sh` for 3 harts.
 
 Rules mode (no LLM): `boot`, `stop`, `status`, `ls /`, `cat README`, `run <cmd>`.

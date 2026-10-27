@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Q1 Irreversibility Budget — Architecture</title>
+<style>
+  @page { size: A4; margin: 16mm 15mm 16mm 15mm; }
+  body { font-family: "DejaVu Sans", "Liberation Sans", Arial, sans-serif; font-size: 10.3pt; line-height: 1.45; color: #1d2330; }
+  h1 { font-size: 21pt; margin: 0 0 4px 0; color: #0f2a4a; }
+  h2 { font-size: 14pt; color: #0f2a4a; border-bottom: 2px solid #c9d6e8; padding-bottom: 3px; margin-top: 22px; }
+  h2, h3 { break-after: avoid; page-break-after: avoid; }
+  h3 { font-size: 11.5pt; color: #22466e; margin: 14px 0 4px 0; }
+  p { margin: 5px 0; text-align: left; }
+  code, pre { font-family: "DejaVu Sans Mono", "Liberation Mono", monospace; font-size: 8.6pt; }
+  code { background: #f1f4f9; padding: 0 3px; border-radius: 3px; }
+  pre { background: #f5f7fb; border: 1px solid #dbe3ef; border-left: 4px solid #5b8bd0; padding: 7px 9px; white-space: pre; overflow: hidden; page-break-inside: avoid; margin: 6px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 6px 0; font-size: 9.2pt; page-break-inside: avoid; }
+  th, td { border: 1px solid #cfd8e6; padding: 4px 6px; vertical-align: top; text-align: left; }
+  th { background: #e8eef7; }
+  .sub { color: #50607a; font-size: 10pt; }
+  .fig { page-break-inside: avoid; margin: 10px 0 12px 0; text-align: center; }
+  .fig svg { max-width: 100%; height: auto; }
+  .cap { font-size: 8.8pt; color: #50607a; margin-top: 3px; text-align: center; }
+  .box { border: 1px solid #cfd8e6; border-radius: 6px; padding: 7px 10px; margin: 8px 0; page-break-inside: avoid; }
+  .why { background: #fff8e8; border-color: #edd9a6; }
+  .new { background: #eef8f0; border-color: #b9dcc0; }
+  .warn { background: #fdeeee; border-color: #eabdbd; }
+  .tag { display: inline-block; font-size: 7.8pt; padding: 0 5px; border-radius: 8px; color: #fff; vertical-align: middle; }
+  .core { background: #3b6fb6; } .ext { background: #2f8f4e; } .str { background: #8a5cb8; }
+  ul, ol { margin: 4px 0 4px 18px; padding: 0; }
+  li { margin: 2px 0; }
+  .toc li { margin: 1px 0; }
+  .pb { page-break-before: always; }
+</style>
+</head>
+<body>
+
+<h1>Irreversibility Budget for Process Groups</h1>
+<div class="sub">CSL3030 Operating Systems Lab · xv6-riscv · Problem 1 · Architecture and design guide (v1, draft for team review)</div>
+
+<div class="box why" style="margin-top:12px">
+<b>Our idea in one line.</b> The kernel charges a process group for the damage it <i>cannot undo</i>, and it can make some actions undoable so that they cost less.
+The required token-bucket budget is the base. On top of it we close the loopholes a flat cost table leaves open:
+group escape, hidden destructive syscalls, cost that ignores size, starvation in BLOCK mode.
+We also add a kernel trash that turns an irreversible delete into a reversible one.
+</div>
+
+<h3>Contents</h3>
+<ol class="toc">
+  <li>Big picture: where the budget sits</li>
+  <li>Spec mode vs strict mode (how we stay safe with the hidden tests)</li>
+  <li>Component 1: the group table and group membership</li>
+  <li>Component 2: the cost model</li>
+  <li>Component 3: the syscall gate (charge before work)</li>
+  <li>Component 4: refill (token bucket math)</li>
+  <li>Component 5: BLOCK and FAIL modes, the fair queue</li>
+  <li>Component 6: creator group on disk (dinode + mkfs)</li>
+  <li>Component 7: nested budgets (escape closure)</li>
+  <li>Component 8: irreversibility-leak audit</li>
+  <li>Component 9: kernel trash (reversibility discount)</li>
+  <li>Component 10: observability (budgetstat, audit ring, circuit breaker)</li>
+  <li>Component 11: agent integration demo</li>
+  <li>Concurrency and locking rules</li>
+  <li>Testing and evidence pipeline</li>
+  <li>File map and team split</li>
+  <li>Timeline</li>
+  <li>Known limitations</li>
+  <li>Viva preparation</li>
+</ol>
+
+<p><span class="tag core">CORE</span> = required by the handout. <span class="tag ext">EXT</span> = our main extension. <span class="tag str">STRETCH</span> = only if time permits.</p>
+
+<!-- ============================================================ -->
+<h2>1. Big picture: where the budget sits</h2>
+<p>An agent decides on an action. A user program carries it out. The action reaches the kernel as a system call.
+The kernel is the last component that sees the action, and the only one that can refuse it.
+Our whole mechanism is one decision point, the <b>budget gate</b>, placed in <code>syscall()</code> before the real handler runs.</p>
+
+<div class="fig">
+<svg viewBox="0 0 760 470" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Arial" font-size="11">
+  <defs>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#44546e"/></marker>
+  </defs>
+  <!-- host -->
+  <rect x="10" y="10" width="740" height="88" rx="8" fill="#f2f6fc" stroke="#9fb4d4"/>
+  <text x="20" y="28" font-weight="bold" fill="#22466e">HOST (Linux) — untrusted decision maker</text>
+  <rect x="30" y="40" width="160" height="46" rx="6" fill="#fff" stroke="#5b8bd0"/>
+  <text x="110" y="59" text-anchor="middle" font-weight="bold">Planner</text>
+  <text x="110" y="75" text-anchor="middle" font-size="9.5">LLM or scripted runaway</text>
+  <rect x="300" y="40" width="160" height="46" rx="6" fill="#fff" stroke="#5b8bd0"/>
+  <text x="380" y="59" text-anchor="middle" font-weight="bold">Tool validator</text>
+  <text x="380" y="75" text-anchor="middle" font-size="9.5">allowlist + schema</text>
+  <rect x="570" y="40" width="160" height="46" rx="6" fill="#fff" stroke="#5b8bd0"/>
+  <text x="650" y="59" text-anchor="middle" font-weight="bold">QEMU bridge</text>
+  <text x="650" y="75" text-anchor="middle" font-size="9.5">serial / TCP console</text>
+  <line x1="190" y1="63" x2="298" y2="63" stroke="#44546e" marker-end="url(#a)"/>
+  <text x="244" y="57" text-anchor="middle" font-size="9">tool call (JSON)</text>
+  <line x1="460" y1="63" x2="568" y2="63" stroke="#44546e" marker-end="url(#a)"/>
+  <text x="514" y="57" text-anchor="middle" font-size="9">fixed command</text>
+  <line x1="650" y1="86" x2="650" y2="122" stroke="#44546e" marker-end="url(#a)"/>
+
+  <!-- user space -->
+  <rect x="10" y="112" width="740" height="76" rx="8" fill="#f6f3fb" stroke="#b9a6d8"/>
+  <text x="20" y="130" font-weight="bold" fill="#5a3d8a">xv6 USER SPACE — faithfully does what it is told</text>
+  <rect x="30" y="140" width="150" height="38" rx="6" fill="#fff" stroke="#8a5cb8"/><text x="105" y="163" text-anchor="middle">rm / cat / echo / sh</text>
+  <rect x="200" y="140" width="150" height="38" rx="6" fill="#fff" stroke="#8a5cb8"/><text x="275" y="163" text-anchor="middle">runaway, forkbomb</text>
+  <rect x="370" y="140" width="150" height="38" rx="6" fill="#fff" stroke="#8a5cb8"/><text x="445" y="163" text-anchor="middle">budgetstat</text>
+  <rect x="540" y="140" width="190" height="38" rx="6" fill="#fff" stroke="#8a5cb8"/><text x="635" y="163" text-anchor="middle">budgettest (harness)</text>
+  <line x1="380" y1="188" x2="380" y2="216" stroke="#44546e" marker-end="url(#a)"/>
+  <text x="388" y="206" font-size="9">ecall → trap (a7 = syscall number)</text>
+
+  <!-- kernel -->
+  <rect x="10" y="220" width="740" height="160" rx="8" fill="#eef8f0" stroke="#9ccaa7"/>
+  <text x="20" y="238" font-weight="bold" fill="#226b39">xv6 KERNEL — the enforcement point</text>
+  <rect x="30" y="250" width="110" height="44" rx="6" fill="#fff" stroke="#2f8f4e"/><text x="85" y="276" text-anchor="middle">usertrap()</text>
+  <rect x="165" y="250" width="110" height="44" rx="6" fill="#fff" stroke="#2f8f4e"/><text x="220" y="276" text-anchor="middle">syscall()</text>
+  <rect x="300" y="244" width="200" height="56" rx="6" fill="#fff4d6" stroke="#c99a22" stroke-width="2"/>
+  <text x="400" y="264" text-anchor="middle" font-weight="bold">BUDGET GATE</text>
+  <text x="400" y="280" text-anchor="middle" font-size="9.5">cost = syscall_cost(num, p)</text>
+  <text x="400" y="293" text-anchor="middle" font-size="9.5">charge(gid, cost)</text>
+  <rect x="525" y="250" width="205" height="44" rx="6" fill="#fff" stroke="#2f8f4e"/><text x="627" y="270" text-anchor="middle">syscalls[num]()</text><text x="627" y="285" text-anchor="middle" font-size="9.5">real work happens only here</text>
+  <line x1="140" y1="272" x2="163" y2="272" stroke="#44546e" marker-end="url(#a)"/>
+  <line x1="275" y1="272" x2="298" y2="272" stroke="#44546e" marker-end="url(#a)"/>
+  <line x1="500" y1="272" x2="523" y2="272" stroke="#2f8f4e" marker-end="url(#a)"/>
+  <text x="511" y="264" text-anchor="middle" font-size="9" fill="#2f8f4e">ok</text>
+  <line x1="400" y1="300" x2="400" y2="318" stroke="#b33" marker-end="url(#a)"/>
+  <text x="408" y="313" font-size="9" fill="#b33">refused → a0 = −1 / blocked → sleep</text>
+  <!-- kernel data -->
+  <rect x="30" y="322" width="150" height="48" rx="6" fill="#fff" stroke="#888"/><text x="105" y="342" text-anchor="middle" font-weight="bold">groups[NGROUP]</text><text x="105" y="357" text-anchor="middle" font-size="9">budget, lock, counters</text>
+  <rect x="195" y="322" width="150" height="48" rx="6" fill="#fff" stroke="#888"/><text x="270" y="342" text-anchor="middle" font-weight="bold">cost table</text><text x="270" y="357" text-anchor="middle" font-size="9">budgetparam.h</text>
+  <rect x="440" y="322" width="140" height="48" rx="6" fill="#fff" stroke="#888"/><text x="510" y="342" text-anchor="middle" font-weight="bold">audit ring</text><text x="510" y="357" text-anchor="middle" font-size="9">last 256 verdicts</text>
+  <rect x="595" y="322" width="135" height="48" rx="6" fill="#fff" stroke="#888"/><text x="662" y="342" text-anchor="middle" font-weight="bold">clockintr()</text><text x="662" y="357" text-anchor="middle" font-size="9">ticks, wakeups</text>
+
+  <!-- disk -->
+  <rect x="10" y="394" width="740" height="66" rx="8" fill="#f7f4ef" stroke="#cdbb9c"/>
+  <text x="20" y="412" font-weight="bold" fill="#7a5a22">DISK (fs.img)</text>
+  <rect x="30" y="420" width="220" height="32" rx="6" fill="#fff" stroke="#a88a55"/><text x="140" y="440" text-anchor="middle">dinode.creator_gid (new field)</text>
+  <rect x="270" y="420" width="220" height="32" rx="6" fill="#fff" stroke="#a88a55"/><text x="380" y="440" text-anchor="middle">/.trash/&lt;gid&gt;/ (EXT)</text>
+  <rect x="510" y="420" width="220" height="32" rx="6" fill="#fff" stroke="#a88a55"/><text x="620" y="440" text-anchor="middle">ordinary files and dirs</text>
+</svg>
+<div class="cap">Figure 1. The full stack. Everything above the yellow gate can be tricked. The gate cannot be talked around because it runs in the kernel.</div>
+</div>
+
+<p><b>Why a group and not a process.</b> A refused process can fork, and the child would start with a fresh allowance.
+So the budget belongs to the whole family. <code>fork()</code> copies <code>gid</code>, and <code>exec()</code> keeps it, because exec changes the program image but not the process.</p>
+
+<!-- ============================================================ -->
+<h2>2. Spec mode vs strict mode</h2>
+<p>The instructor keeps about 70% of the tests hidden, and they are written against the handout's behaviour.
+If our extensions change the counts (for example a size-dependent unlink cost), hidden tests that hand-calculate counts would fail.
+So every extension sits behind one runtime switch.</p>
+
+<table>
+<tr><th>Mode</th><th>Behaviour</th><th>Used for</th></tr>
+<tr><td><b>SPEC</b> (default at boot)</td><td>Exactly the handout: flat cost table, any process may <code>setgroup</code>/<code>setbudget</code>, plain BLOCK/FAIL, unlink really deletes.</td><td>Hidden tests, <code>usertests</code>, required graphs.</td></tr>
+<tr><td><b>STRICT</b></td><td>Turns on nested budgets, leak charging, size-proportional cost, fair queue, trash, and the circuit breaker. Each feature also has its own bit.</td><td>Our attack demos, extension graphs, agent demo.</td></tr>
+</table>
+<pre>// kernel/budgetparam.h  — the ONE place where team parameters live
+#define BP_NESTED     (1&lt;&lt;0)   // escape closure
+#define BP_LEAKS      (1&lt;&lt;1)   // charge O_TRUNC, overwrite, unlink of dirs ...
+#define BP_PROPORTION (1&lt;&lt;2)   // unlink cost grows with blocks freed
+#define BP_FAIRQ      (1&lt;&lt;3)   // FIFO tickets in BLOCK mode
+#define BP_TRASH      (1&lt;&lt;4)   // reversible delete
+#define BP_BREAKER    (1&lt;&lt;5)   // freeze group after repeated refusals
+int budget_policy = 0;         // 0 = SPEC mode. Changed only by root via budgetctl()</pre>
+<p>A new syscall <code>budgetctl(flags)</code> (callable only from group 0) flips the bits, so one kernel build runs every experiment.</p>
+
+<!-- ============================================================ -->
+<h2>3. Component 1: the group table <span class="tag core">CORE</span></h2>
+<p>The budget is shared, so it lives in a global table, not in <code>struct proc</code>. <code>struct proc</code> gets only <code>int gid</code>.
+There is one spinlock per entry, not one global lock: two groups on different CPUs never contend.</p>
+
+<div class="fig">
+<svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Arial" font-size="11">
+  <defs><marker id="b" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#44546e"/></marker></defs>
+  <text x="20" y="20" font-weight="bold" fill="#22466e">proc[NPROC]</text>
+  <g>
+    <rect x="20" y="30" width="170" height="30" rx="4" fill="#fff" stroke="#8a5cb8"/><text x="30" y="50">pid 3  sh       gid 0</text>
+    <rect x="20" y="66" width="170" height="30" rx="4" fill="#fff" stroke="#8a5cb8"/><text x="30" y="86">pid 7  agent    gid 2</text>
+    <rect x="20" y="102" width="170" height="30" rx="4" fill="#fff" stroke="#8a5cb8"/><text x="30" y="122">pid 8  rm       gid 2</text>
+    <rect x="20" y="138" width="170" height="30" rx="4" fill="#fff" stroke="#8a5cb8"/><text x="30" y="158">pid 9  rm(fork) gid 2</text>
+    <rect x="20" y="174" width="170" height="30" rx="4" fill="#fff" stroke="#8a5cb8"/><text x="30" y="194">pid 11 test     gid 3</text>
+  </g>
+  <text x="330" y="20" font-weight="bold" fill="#22466e">groups[NGROUP]  (kernel/budget.c)</text>
+  <rect x="330" y="30" width="410" height="34" rx="4" fill="#f4f4f4" stroke="#999"/>
+  <text x="340" y="51">[0] root   unlimited                       lock0</text>
+  <rect x="330" y="70" width="410" height="34" rx="4" fill="#fff4d6" stroke="#c99a22"/>
+  <text x="340" y="91">[2] budget 23 / max 50 · refill 10 · BLOCK  lock2</text>
+  <rect x="330" y="110" width="410" height="34" rx="4" fill="#fff" stroke="#999"/>
+  <text x="340" y="131">[3] budget 50 / max 50 · refill  5 · FAIL   lock3</text>
+  <rect x="330" y="150" width="410" height="34" rx="4" fill="#fff" stroke="#ddd" stroke-dasharray="4 3"/>
+  <text x="340" y="171" fill="#888">[4..NGROUP-1] unused (in_use = 0)</text>
+  <line x1="190" y1="81" x2="328" y2="86" stroke="#44546e" marker-end="url(#b)"/>
+  <line x1="190" y1="117" x2="328" y2="88" stroke="#44546e" marker-end="url(#b)"/>
+  <line x1="190" y1="153" x2="328" y2="90" stroke="#44546e" marker-end="url(#b)"/>
+  <line x1="190" y1="189" x2="328" y2="128" stroke="#44546e" marker-end="url(#b)"/>
+  <line x1="190" y1="45" x2="328" y2="47" stroke="#44546e" marker-end="url(#b)"/>
+  <text x="20" y="232" font-size="10" fill="#50607a">Three processes share group 2, so a fork cannot reset the allowance. Each row has its own lock.</text>
+</svg>
+<div class="cap">Figure 2. Many processes point at one shared group entry.</div>
+</div>
+
+<pre>struct group {
+  struct spinlock lock;
+  int  in_use, parent;           // parent used only in STRICT/nested mode
+  int  budget, max, refill, mode;// mode = BUDGET_BLOCK or BUDGET_FAIL
+  uint last_refill;              // tick of last whole-period refill
+  int  n_allowed, n_blocked, n_refused;   // for budgetstat
+  uint next_ticket, now_serving; // fair queue (EXT)
+  int  refusals_window;          // circuit breaker (STRETCH)
+};</pre>
+<p><b>Syscalls.</b> <code>setgroup(gid)</code> moves the caller into a group (children inherit it on fork).
+<code>setbudget(gid, max, refill_per_100_ticks, mode)</code> configures a group and fills it to <code>max</code>.
+Group 0 is the root: unlimited and never charged, so init and the shell keep working and <code>usertests</code> stays unaffected.
+Choosing gid 0 as unlimited is our decision. We document it, and the default cost path short-circuits when <code>gid == 0</code>.</p>
+
+<!-- ============================================================ -->
+<h2>4. Component 2: the cost model <span class="tag core">CORE</span> + <span class="tag ext">EXT</span></h2>
+<p>Each syscall gets a cost from <code>syscall_cost(num, p)</code>. Some costs depend on the arguments (which file, who created it), so the function
+<i>peeks</i> at the arguments before the call runs. It only reads, it never changes anything.</p>
+
+<table>
+<tr><th>Syscall (case)</th><th>Handout example</th><th>How we decide it before the call</th><th>STRICT extension</th></tr>
+<tr><td>unlink</td><td>10</td><td>flat</td><td>10 + k·⌈size/BSIZE⌉, dir unlink also charged</td></tr>
+<tr><td>write to console</td><td>1 per call</td><td>fd → struct file → type FD_DEVICE, major CONSOLE</td><td>same</td></tr>
+<tr><td>write to file created by own group</td><td>0</td><td>fd → inode → <code style="white-space:nowrap">ip-&gt;creator_gid == p-&gt;gid</code></td><td>same</td></tr>
+<tr><td>write to any other file</td><td>3</td><td>creator differs</td><td>overwrite of existing bytes (off &lt; size) charged as destruction</td></tr>
+<tr><td>exec of file written by another group</td><td>5</td><td>argstr path → namei → creator_gid</td><td>same, also follows hard links</td></tr>
+<tr><td>open(O_TRUNC) of another group's file</td><td>— (0, a leak)</td><td>—</td><td>charged like unlink of its blocks</td></tr>
+<tr><td>everything else</td><td>0</td><td>table default</td><td>same</td></tr>
+</table>
+<p>The real numbers come from our <b>assigned per-team cost table</b>. They go into <code>budgetparam.h</code> and nowhere else.</p>
+
+<pre>int syscall_cost(int num, struct proc *p) {
+  if (p-&gt;gid == 0) return 0;
+  switch (num) {
+  case SYS_unlink: return cost_unlink(p);           // peeks path, size if BP_PROPORTION
+  case SYS_write:  return cost_write(p);            // peeks fd: console / own / other
+  case SYS_exec:   return cost_exec(p);             // peeks path creator
+  case SYS_open:   return (budget_policy &amp; BP_LEAKS) ? cost_open_trunc(p) : 0;
+  default:         return COST_DEFAULT[num];
+  }
+}</pre>
+
+<div class="box why"><b>Why peeking is safe.</b> Reading an fd or calling <code>namei()</code> has no side effects. Inside <code>begin_op()/end_op()</code>
+we look up the inode, read <code>creator_gid</code> and <code>size</code>, then <code>iunlockput()</code>. Nothing changes on disk.
+The peek is done <b>before</b> <code>charge()</code>, because charge may sleep and we must not sleep holding an inode lock.</div>
+
+<!-- ============================================================ -->
+<h2>5. Component 3: the syscall gate <span class="tag core">CORE</span></h2>
+
+<div class="fig">
+<svg viewBox="0 0 760 360" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Arial" font-size="11">
+  <defs><marker id="c" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#44546e"/></marker></defs>
+  <rect x="300" y="10" width="160" height="34" rx="17" fill="#e8eef7" stroke="#5b8bd0"/><text x="380" y="31" text-anchor="middle">syscall arrives (a7)</text>
+  <line x1="380" y1="44" x2="380" y2="62" stroke="#44546e" marker-end="url(#c)"/>
+  <rect x="290" y="64" width="180" height="38" rx="5" fill="#fff" stroke="#5b8bd0"/><text x="380" y="80" text-anchor="middle">cost = syscall_cost(num,p)</text><text x="380" y="95" text-anchor="middle" font-size="9">peek args, no side effects</text>
+  <line x1="380" y1="102" x2="380" y2="120" stroke="#44546e" marker-end="url(#c)"/>
+  <rect x="290" y="122" width="180" height="34" rx="5" fill="#fff" stroke="#5b8bd0"/><text x="380" y="143" text-anchor="middle">acquire g→lock; refill(g)</text>
+  <line x1="380" y1="156" x2="380" y2="174" stroke="#44546e" marker-end="url(#c)"/>
+  <polygon points="380,176 470,210 380,244 290,210" fill="#fff4d6" stroke="#c99a22" stroke-width="1.5"/>
+  <text x="380" y="207" text-anchor="middle">budget ≥ cost ?</text><text x="380" y="221" text-anchor="middle" font-size="9">(and my turn, if FAIRQ)</text>
+  <!-- yes -->
+  <line x1="470" y1="210" x2="548" y2="210" stroke="#2f8f4e" marker-end="url(#c)"/><text x="505" y="203" font-size="10" fill="#2f8f4e">yes</text>
+  <rect x="550" y="186" width="190" height="48" rx="5" fill="#eef8f0" stroke="#2f8f4e"/><text x="645" y="205" text-anchor="middle">budget −= cost; allowed++</text><text x="645" y="222" text-anchor="middle">release lock</text>
+  <line x1="645" y1="234" x2="645" y2="262" stroke="#2f8f4e" marker-end="url(#c)"/>
+  <rect x="550" y="264" width="190" height="40" rx="5" fill="#2f8f4e" stroke="#226b39"/><text x="645" y="289" text-anchor="middle" fill="#fff" font-weight="bold">a0 = syscalls[num]()</text>
+  <!-- no -->
+  <line x1="290" y1="210" x2="212" y2="210" stroke="#b33" marker-end="url(#c)"/><text x="245" y="203" font-size="10" fill="#b33">no</text>
+  <polygon points="140,180 210,210 140,240 70,210" fill="#fff" stroke="#b33"/><text x="140" y="214" text-anchor="middle">mode?</text>
+  <line x1="140" y1="240" x2="140" y2="262" stroke="#b33" marker-end="url(#c)"/><text x="148" y="255" font-size="9.5" fill="#b33">FAIL</text>
+  <rect x="50" y="264" width="180" height="40" rx="5" fill="#fdeeee" stroke="#b33"/><text x="140" y="281" text-anchor="middle">refused++; release</text><text x="140" y="296" text-anchor="middle">a0 = −1, work never runs</text>
+  <line x1="140" y1="180" x2="140" y2="96" stroke="#c99a22" marker-end="url(#c)"/><text x="148" y="160" font-size="9.5" fill="#a07a14">BLOCK</text>
+  <rect x="40" y="56" width="200" height="40" rx="5" fill="#fff4d6" stroke="#c99a22"/><text x="140" y="73" text-anchor="middle">blocked++; sleep_prepare;</text><text x="140" y="88" text-anchor="middle">release; sleep(); reacquire</text>
+  <path d="M240,76 C 300,40 255,140 288,139" fill="none" stroke="#c99a22" marker-end="url(#c)"/>
+  <text x="252" y="56" font-size="9" fill="#a07a14">loop: refill, re-check (while, not if)</text>
+  <text x="20" y="340" font-size="10" fill="#50607a">Killed while sleeping? After waking, check killed(p) → return −1 without charging, so kill works on blocked processes.</text>
+</svg>
+<div class="cap">Figure 3. The gate. The charge sits before the real handler. Charging after the work would let a budget of 1 permit an unbounded delete.</div>
+</div>
+
+<pre>// kernel/syscall.c
+if (num &gt; 0 &amp;&amp; num &lt; NELEM(syscalls) &amp;&amp; syscalls[num]) {
+  int cost = syscall_cost(num, p);
+  if (cost &gt; 0 &amp;&amp; charge(p-&gt;gid, cost) &lt; 0) {
+    p-&gt;trapframe-&gt;a0 = -1;            // refused (FAIL) or killed while blocked
+    return;
+  }
+  p-&gt;trapframe-&gt;a0 = syscalls[num]();
+}</pre>
+
+<!-- ============================================================ -->
+<h2>6. Component 4: refill and the token-bucket math <span class="tag core">CORE</span></h2>
+<p>We refill <b>lazily</b>: no timer work per group. Whenever someone touches a group, we compute how many whole 100-tick periods passed.</p>
+<pre>periods      = (now − last_refill) / 100          // uint subtraction: survives wraparound
+budget       = min(max, budget + periods · refill)
+last_refill += periods · 100                      // NOT = now; that throws the remainder away</pre>
+<p>Writing <code>last_refill = now</code> instead would lose up to 99 ticks on every refill, so the real rate drifts slow. The staircase in the graph would show it.</p>
+<p><b>Reading ticks without a race.</b> <code>ticks</code> is changed under <code>tickslock</code> by <code>clockintr()</code>.
+Inside <code>refill()</code> we take <code>tickslock</code> only to copy <code>ticks</code> into a local. Lock order is always <code>g→lock</code> then <code>tickslock</code>, never the reverse.</p>
+
+<h3>Expected curve (this is what we must see in the graph)</h3>
+<p>Let <i>B</i> = start budget, <i>c</i> = unlink cost, <i>r</i> = refill per 100 ticks. Completed deletions by tick <i>t</i>:</p>
+<pre>FAIL :  N(t) = ⌊B / c⌋                              (flat forever)
+BLOCK:  N(t) = ⌊(B + r·⌊t/100⌋) / c⌋   (until the 200 files run out)</pre>
+<p>With B = 50, c = 10, r = 10: FAIL stops at 5. BLOCK gives 5 at once, then one more every 100 ticks.</p>
+
+<div class="fig">
+<svg viewBox="0 0 760 270" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Arial" font-size="10">
+  <line x1="70" y1="230" x2="730" y2="230" stroke="#333"/>
+  <line x1="70" y1="230" x2="70" y2="20" stroke="#333"/>
+  <text x="400" y="258" text-anchor="middle">ticks</text>
+  <text x="22" y="125" transform="rotate(-90 22 125)" text-anchor="middle">completed unlinks</text>
+  <!-- y ticks: 0..12, 15px per unit -->
+  <g fill="#555" text-anchor="end">
+    <text x="64" y="233">0</text><text x="64" y="158">5</text><text x="64" y="83">10</text>
+  </g>
+  <line x1="66" y1="155" x2="730" y2="155" stroke="#eee"/><line x1="66" y1="80" x2="730" y2="80" stroke="#eee"/>
+  <!-- x: 0..1000 ticks, 0.6px per tick → 600px -->
+  <g fill="#555" text-anchor="middle">
+    <text x="70" y="244">0</text><text x="190" y="244">200</text><text x="310" y="244">400</text><text x="430" y="244">600</text><text x="550" y="244">800</text><text x="670" y="244">1000</text>
+  </g>
+  <!-- FAIL -->
+  <polyline points="70,230 74,155 730,155" fill="none" stroke="#b33" stroke-width="2.2" stroke-dasharray="6 3"/>
+  <!-- BLOCK staircase: 5 at t=0, +1 every 100 ticks (60px) -->
+  <polyline fill="none" stroke="#2f6fd0" stroke-width="2.2"
+   points="70,230 74,155 130,155 130,140 190,140 190,125 250,125 250,110 310,110 310,95 370,95 370,80 430,80 430,65 490,65 490,50 550,50 550,35 610,35 610,20 670,20"/>
+  <rect x="520" y="175" width="200" height="44" fill="#fff" stroke="#ccc"/>
+  <line x1="530" y1="190" x2="560" y2="190" stroke="#2f6fd0" stroke-width="2.2"/><text x="566" y="194">BLOCK: staircase at rate r/c</text>
+  <line x1="530" y1="208" x2="560" y2="208" stroke="#b33" stroke-width="2.2" stroke-dasharray="6 3"/><text x="566" y="212">FAIL: flat at ⌊B/c⌋ = 5</text>
+</svg>
+<div class="cap">Figure 4. Expected shape (illustrative, from the formula; the real graph comes from QEMU logs). A step every 100 ticks is the refill period.</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Component 5: BLOCK, FAIL and the fair queue</h2>
+<p><span class="tag core">CORE</span> FAIL returns −1 at once. BLOCK sleeps on <code>&amp;ticks</code> (which <code>clockintr()</code> already wakes every tick), then refills and re-checks in a <code>while</code> loop.
+It must be a loop: another process in the same group may wake first and take the refill.</p>
+
+<p><span class="tag ext">EXT</span> <b>The starvation problem.</b> In the plain design a cheap call always wins.
+Say group 2 has a <code>write</code> loop (cost 1) and a blocked <code>unlink</code> (cost 10). Every refill of 10 gets eaten one unit at a time
+by the writer before the unlink ever sees 10. The unlink can wait forever. We fix it with tickets.</p>
+
+<div class="fig">
+<svg viewBox="0 0 760 200" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Arial" font-size="11">
+  <defs><marker id="d" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#44546e"/></marker></defs>
+  <text x="20" y="22" font-weight="bold" fill="#b33">Plain (spec): whoever wakes first wins</text>
+  <rect x="20" y="32" width="330" height="60" rx="6" fill="#fdeeee" stroke="#e0a9a9"/>
+  <text x="30" y="52">refill +10 →  write(1) write(1) write(1) …</text>
+  <text x="30" y="70">unlink(10) wakes: budget 3 &lt; 10 → sleep again</text>
+  <text x="30" y="86" fill="#b33">unlink can starve forever</text>
+  <text x="400" y="22" font-weight="bold" fill="#2f8f4e">Fair queue (STRICT): FIFO tickets per group</text>
+  <rect x="400" y="32" width="340" height="60" rx="6" fill="#eef8f0" stroke="#9ccaa7"/>
+  <text x="410" y="52">unlink takes ticket 7, write takes ticket 8</text>
+  <text x="410" y="70">only now_serving (7) may charge; 8 waits</text>
+  <text x="410" y="86" fill="#2f8f4e">bounded wait: ⌈cost/r⌉·100 ticks per head</text>
+  <rect x="120" y="120" width="70" height="40" rx="5" fill="#fff4d6" stroke="#c99a22"/><text x="155" y="145" text-anchor="middle">#7 unlink</text>
+  <rect x="200" y="120" width="70" height="40" rx="5" fill="#fff" stroke="#999"/><text x="235" y="145" text-anchor="middle">#8 write</text>
+  <rect x="280" y="120" width="70" height="40" rx="5" fill="#fff" stroke="#999"/><text x="315" y="145" text-anchor="middle">#9 exec</text>
+  <text x="20" y="145">head →</text>
+  <line x1="120" y1="172" x2="350" y2="172" stroke="#44546e" marker-end="url(#d)"/><text x="235" y="188" text-anchor="middle" font-size="9.5">arrival order</text>
+  <text x="400" y="135" font-size="10">Trade-off: head-of-line blocking. A cheap call</text>
+  <text x="400" y="150" font-size="10">waits behind an expensive one. We measure both</text>
+  <text x="400" y="165" font-size="10">max wait and throughput, plain vs fair.</text>
+</svg>
+<div class="cap">Figure 5. Ticket lock idea applied to budget waiting.</div>
+</div>
+
+<p><span class="tag str">STRETCH</span> <b>No thundering herd.</b> With <i>n</i> blocked processes, the plain design does <i>n</i> wakeups per tick, almost all useless.
+Since refill is deterministic, the head can compute when it will be affordable:
+<code>t* = last_refill + 100·⌈(cost − budget)/r⌉</code>. It then sleeps on a per-group channel that <code>clockintr()</code> wakes only at <code>t*</code>.
+Metric: wakeups per successful charge, plain vs targeted.</p>
+
+<!-- ============================================================ -->
+<h2>8. Component 6: creator group on disk <span class="tag core">CORE</span></h2>
+<p>"Write to a file created by your own group" needs to know who created the file, even after a reboot. So it goes into the on-disk inode.</p>
+
+<div class="fig">
+<svg viewBox="0 0 760 150" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Arial" font-size="10">
+  <text x="10" y="18" font-weight="bold">today: struct dinode = 64 B → IPB = 1024/64 = 16</text>
+  <rect x="10" y="26" width="80" height="28" fill="#e8eef7" stroke="#5b8bd0"/><text x="50" y="44" text-anchor="middle">4 shorts 8B</text>
+  <rect x="90" y="26" width="50" height="28" fill="#e8eef7" stroke="#5b8bd0"/><text x="115" y="44" text-anchor="middle">size 4B</text>
+  <rect x="140" y="26" width="520" height="28" fill="#e8eef7" stroke="#5b8bd0"/><text x="400" y="44" text-anchor="middle">addrs[NDIRECT+1] = 13 × 4B = 52B</text>
+  <text x="10" y="82" font-weight="bold">ours: + short creator_gid + short pad = 68 B → IPB = ⌊1024/68⌋ = 15</text>
+  <rect x="10" y="90" width="80" height="28" fill="#e8eef7" stroke="#5b8bd0"/><text x="50" y="108" text-anchor="middle">4 shorts 8B</text>
+  <rect x="90" y="90" width="50" height="28" fill="#e8eef7" stroke="#5b8bd0"/><text x="115" y="108" text-anchor="middle">size 4B</text>
+  <rect x="140" y="90" width="520" height="28" fill="#e8eef7" stroke="#5b8bd0"/><text x="400" y="108" text-anchor="middle">addrs[13] 52B</text>
+  <rect x="660" y="90" width="44" height="28" fill="#fff4d6" stroke="#c99a22"/><text x="682" y="108" text-anchor="middle">gid</text>
+  <rect x="704" y="90" width="44" height="28" fill="#f4f4f4" stroke="#aaa"/><text x="726" y="108" text-anchor="middle">pad</text>
+  <text x="10" y="140" fill="#50607a">Inodes no longer pack perfectly (1024 − 15·68 = 4 B wasted per block). Max file size is unchanged.</text>
+</svg>
+<div class="cap">Figure 6. dinode layout before and after.</div>
+</div>
+
+<table>
+<tr><th>Option</th><th>Effect</th><th>Decision</th></tr>
+<tr><td>Add a field (68 B)</td><td>IPB 16→15. mkfs and kernel both use <code>IPB</code> from fs.h, so they stay in agreement. Needs <code>make clean</code>.</td><td><b>Chosen</b>: simplest, nothing else changes meaning.</td></tr>
+<tr><td>Shrink NDIRECT 12→11</td><td>IPB stays 16, max file size drops 1 KB. Could break <code>usertests bigfile</code>.</td><td>Rejected</td></tr>
+<tr><td>Steal bits from <code>type</code></td><td>Every read of type needs masking.</td><td>Rejected: easy to miss one place</td></tr>
+</table>
+<p>The field is mirrored in the in-memory <code>struct inode</code> and copied in <code>ilock()</code>/<code>iupdate()</code>. <code>ialloc()</code> sets it to the caller's gid and <b>always overwrites</b> it on reuse, so a deleted and recreated file can't inherit an old owner.
+<code>mkfs</code> writes 0 (root) for files baked into fs.img, so <code>/README</code> and the binaries belong to root.</p>
+
+<!-- ============================================================ -->
+<h2>9. Component 7: nested budgets, closing the escape <span class="tag ext">EXT</span></h2>
+<div class="box warn"><b>The hole in the plain spec.</b> The handout closes the fork attack, but if any process may call <code>setgroup(99)</code> and <code>setbudget(99, 1000, …)</code>,
+a runaway simply moves itself into a fresh, rich group. That is the fork bomb again, one syscall later.</div>
+
+<div class="fig">
+<svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Arial" font-size="11">
+  <defs><marker id="e" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#44546e"/></marker></defs>
+  <rect x="300" y="12" width="160" height="44" rx="6" fill="#f4f4f4" stroke="#888"/><text x="380" y="32" text-anchor="middle" font-weight="bold">group 0 (root)</text><text x="380" y="48" text-anchor="middle" font-size="9.5">only root may setbudget</text>
+  <rect x="130" y="96" width="200" height="50" rx="6" fill="#fff4d6" stroke="#c99a22"/><text x="230" y="116" text-anchor="middle" font-weight="bold">group 2: agent</text><text x="230" y="133" text-anchor="middle" font-size="9.5">max 50, refill 10</text>
+  <rect x="440" y="96" width="200" height="50" rx="6" fill="#fff" stroke="#999"/><text x="540" y="116" text-anchor="middle" font-weight="bold">group 3: build</text><text x="540" y="133" text-anchor="middle" font-size="9.5">max 30, refill 5</text>
+  <rect x="40" y="186" width="190" height="50" rx="6" fill="#fff" stroke="#c99a22"/><text x="135" y="206" text-anchor="middle">group 5: tool helper</text><text x="135" y="223" text-anchor="middle" font-size="9.5">carved: 20 of parent's 50</text>
+  <rect x="250" y="186" width="190" height="50" rx="6" fill="#fdeeee" stroke="#b33" stroke-dasharray="5 3"/><text x="345" y="206" text-anchor="middle" fill="#b33">setgroup(3) / setgroup(0)</text><text x="345" y="223" text-anchor="middle" font-size="9.5" fill="#b33">refused: not a descendant</text>
+  <line x1="350" y1="56" x2="250" y2="94" stroke="#44546e" marker-end="url(#e)"/>
+  <line x1="410" y1="56" x2="520" y2="94" stroke="#44546e" marker-end="url(#e)"/>
+  <line x1="200" y1="146" x2="150" y2="184" stroke="#44546e" marker-end="url(#e)"/>
+  <line x1="260" y1="146" x2="330" y2="184" stroke="#b33" stroke-dasharray="4 3" marker-end="url(#e)"/>
+  <text x="470" y="200" font-size="10">Invariant: for every group g,</text>
+  <text x="470" y="216" font-size="10">Σ max(children) ≤ max(g)  and</text>
+  <text x="470" y="232" font-size="10">Σ refill(children) ≤ refill(g)</text>
+</svg>
+<div class="cap">Figure 7. Groups form a tree. A process can only move down into a new subgroup, never up or sideways.</div>
+</div>
+
+<p><b>Rules in STRICT mode.</b></p>
+<ol>
+<li><code>setbudget</code> is only allowed on a group that is a strict descendant of the caller's group (root can configure anything).</li>
+<li>Creating a subgroup <b>carves</b> its <code>max</code> and <code>refill</code> out of the parent: the parent's remaining budget and refill go down by the same amount. When the subgroup dies (its last process exits), whatever is left returns to the parent.</li>
+<li><code>setgroup(g)</code> is only allowed into a descendant of the current group.</li>
+</ol>
+<p><b>Why this is enough.</b> Total spend of any subtree per 100 ticks ≤ refill of its root. No sequence of fork, setgroup or setbudget can create budget out of nothing.
+We prove it in the report with one line of induction on tree depth, and show the escape attack succeeding in SPEC mode and failing in STRICT mode.</p>
+<p><b>Why carve-out and not hierarchical charging.</b> Charging every ancestor on every syscall needs several group locks at once (deadlock risk, slower). With carve-out each charge still touches exactly one group lock. Only group creation and exit touch two locks, always taken parent before child.</p>
+
+<!-- ============================================================ -->
+<h2>10. Component 8: irreversibility-leak audit <span class="tag ext">EXT</span></h2>
+<p>The handout charges <code>unlink</code>, but data can be destroyed without unlink. Each row below is an attack program in <code>user/leaks/</code>.
+The report table is: attack, destroyed in SPEC mode?, charged in STRICT mode?, and the mechanism that charged it.</p>
+<table>
+<tr><th>#</th><th>Leak</th><th>Why the flat table misses it</th><th>STRICT rule</th></tr>
+<tr><td>L1</td><td><code>open(f, O_TRUNC)</code> on another group's file</td><td>open costs 0, but all data is gone</td><td>charge like unlink of its blocks</td></tr>
+<tr><td>L2</td><td>Overwrite in place: open + write at offset 0</td><td>charged 3 like an append, but old bytes are lost</td><td>overwritten bytes charged as destruction</td></tr>
+<tr><td>L3</td><td><code>link(victim, tmp)</code>, then unlink both names</td><td>first unlink frees nothing, second one does</td><td>charge when nlink reaches 0 (real loss), not per name</td></tr>
+<tr><td>L4</td><td>Delete a directory tree file by file via a helper child</td><td>covered by group budget</td><td>control test: shows the base design already handles it</td></tr>
+<tr><td>L5</td><td>Exec a foreign binary under a hard-link name</td><td>exec cost uses inode creator, so the name does not matter</td><td>control test</td></tr>
+<tr><td>L6</td><td>Escape via setgroup/setbudget</td><td>see Component 7</td><td>nested budgets</td></tr>
+<tr><td>L7</td><td>Fill the disk (write until ENOSPC) so others fail</td><td>own-file writes cost 0</td><td>documented limitation, or a per-group block quota (stretch)</td></tr>
+</table>
+<p>Keeping the honest "control" rows (where the base design already wins) and the "limitation" row scores better than claiming everything is fixed.</p>
+
+<!-- ============================================================ -->
+<h2>11. Component 9: kernel trash, the reversibility discount <span class="tag ext">EXT</span></h2>
+<p>This is the part that makes the project about <i>irreversibility</i> and not only rate limiting.
+If the kernel can undo a delete, the delete isn't irreversible, so it should be cheap. The full price is paid when the undo becomes impossible.</p>
+
+<div class="fig">
+<svg viewBox="0 0 760 210" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Arial" font-size="11">
+  <defs><marker id="f" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#44546e"/></marker></defs>
+  <rect x="40" y="70" width="150" height="60" rx="30" fill="#eef8f0" stroke="#2f8f4e" stroke-width="1.5"/><text x="115" y="96" text-anchor="middle" font-weight="bold">LIVE</text><text x="115" y="113" text-anchor="middle" font-size="9.5">/docs/a.txt</text>
+  <rect x="305" y="70" width="150" height="60" rx="30" fill="#fff4d6" stroke="#c99a22" stroke-width="1.5"/><text x="380" y="96" text-anchor="middle" font-weight="bold">TRASHED</text><text x="380" y="113" text-anchor="middle" font-size="9.5">/.trash/2/&lt;inum&gt;</text>
+  <rect x="570" y="70" width="150" height="60" rx="30" fill="#fdeeee" stroke="#b33" stroke-width="1.5"/><text x="645" y="96" text-anchor="middle" font-weight="bold">GONE</text><text x="645" y="113" text-anchor="middle" font-size="9.5">blocks freed</text>
+  <path d="M190,88 L303,88" stroke="#44546e" marker-end="url(#f)"/><text x="246" y="80" text-anchor="middle" font-size="9.5">unlink: cost c_rev (e.g. 1)</text>
+  <path d="M305,116 L192,116" stroke="#2f8f4e" marker-end="url(#f)"/><text x="248" y="134" text-anchor="middle" font-size="9.5" fill="#2f8f4e">undelete(): cost 0</text>
+  <path d="M455,100 L568,100" stroke="#b33" marker-end="url(#f)"/><text x="512" y="92" text-anchor="middle" font-size="9.5" fill="#b33">purge / evict</text>
+  <text x="512" y="118" text-anchor="middle" font-size="9.5" fill="#b33">cost c_irr (full price)</text>
+  <text x="40" y="170" font-size="10">Trash has a per-group quota Q blocks. A new trash insert that would exceed Q first evicts the oldest entry,</text>
+  <text x="40" y="186" font-size="10">and that eviction is charged at full price before anything happens. So the irreversible cost is never skipped, only delayed.</text>
+</svg>
+<div class="cap">Figure 8. State machine of a deleted file under BP_TRASH.</div>
+</div>
+
+<p><b>How it works in xv6.</b> <code>unlink</code> under BP_TRASH does, inside one <code>begin_op/end_op</code>:
+<code>dirlink(/.trash/&lt;gid&gt;, &lt;inum&gt;, ip)</code>, then removes the old directory entry. nlink stays 1, so no blocks are freed.
+A side table <code>trash[NTRASH] = {gid, inum, original path, tick}</code> records it. <code>undelete(inum)</code> reverses it. <code>purge(gid)</code> does the real unlink and charges the full price.
+Both directory updates touch few blocks and fit under <code>MAXOPBLOCKS = 10</code>.</p>
+<p><b>Key property to state in the report.</b> The total irreversible cost charged to a group equals the full-price cost of the files it actually destroyed. With the trash, a runaway agent that deletes 200 files only <i>trashes</i> them, and the user can restore everything. This is the demo.</p>
+
+<!-- ============================================================ -->
+<h2>12. Component 10: observability</h2>
+<p><span class="tag core">CORE</span> <code>budgetstat</code> calls <code>getbudgetstat(gid, struct budgetinfo *out)</code> (copyout) for each in-use group and prints:</p>
+<pre>gid  mode   budget/max  refill  allowed  blocked  refused  parent
+0    root   -           -       -        -        -        -
+2    BLOCK  23/50       10      27       14       0        0
+3    FAIL   0/30        5       6        0        194      0</pre>
+<p><span class="tag ext">EXT</span> <b>Audit ring.</b> A 256-entry kernel ring of <code>(tick, gid, pid, syscall, cost, verdict)</code>. <code>budgetstat -v</code> dumps it. This gives the raw evidence for every graph.</p>
+<p><span class="tag str">STRETCH</span> <b>Circuit breaker.</b> If a group gets more than N refusals inside W ticks, it is a runaway retry loop. The kernel freezes the group (every charge fails) and prints one line. Root can unfreeze.</p>
+
+<!-- ============================================================ -->
+<h2>13. Component 11: agent integration demo <span class="tag ext">EXT</span></h2>
+<p>This uses the Agentic-system handout. A Python agent on the host talks to xv6 through a QEMU serial bridge (<code>-serial tcp::4444,server</code>, wait for the <code>$</code> prompt, with timeouts).
+A scripted planner reads <code>/inbox.txt</code>, which says "delete every file", and tries to delete 200 files.</p>
+
+<div class="fig">
+<svg viewBox="0 0 760 140" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Arial" font-size="10.5">
+  <defs><marker id="g" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#44546e"/></marker></defs>
+  <rect x="10" y="20" width="130" height="50" rx="6" fill="#fff" stroke="#5b8bd0"/><text x="75" y="42" text-anchor="middle">read /inbox.txt</text><text x="75" y="58" text-anchor="middle" font-size="9">"delete all files"</text>
+  <rect x="165" y="20" width="130" height="50" rx="6" fill="#fff" stroke="#5b8bd0"/><text x="230" y="42" text-anchor="middle">planner proposes</text><text x="230" y="58" text-anchor="middle" font-size="9">200 × rm</text>
+  <rect x="320" y="20" width="130" height="50" rx="6" fill="#fff" stroke="#5b8bd0"/><text x="385" y="42" text-anchor="middle">validator passes</text><text x="385" y="58" text-anchor="middle" font-size="9">rm is an allowed tool</text>
+  <rect x="475" y="20" width="130" height="50" rx="6" fill="#fff4d6" stroke="#c99a22"/><text x="540" y="42" text-anchor="middle">kernel gate</text><text x="540" y="58" text-anchor="middle" font-size="9">group 2 budget</text>
+  <rect x="630" y="20" width="120" height="50" rx="6" fill="#eef8f0" stroke="#2f8f4e"/><text x="690" y="42" text-anchor="middle">damage capped</text><text x="690" y="58" text-anchor="middle" font-size="9">5 files, rest refused</text>
+  <line x1="140" y1="45" x2="163" y2="45" stroke="#44546e" marker-end="url(#g)"/>
+  <line x1="295" y1="45" x2="318" y2="45" stroke="#44546e" marker-end="url(#g)"/>
+  <line x1="450" y1="45" x2="473" y2="45" stroke="#44546e" marker-end="url(#g)"/>
+  <line x1="605" y1="45" x2="628" y2="45" stroke="#44546e" marker-end="url(#g)"/>
+  <text x="10" y="100">Runs: (1) no budget → 200 deleted; (2) FAIL, B=50 → exactly ⌊50/c⌋ deleted; (3) STRICT + trash → 200 trashed, all restored with undelete.</text>
+  <text x="10" y="118">The agent can also call getbudget() before acting and degrade gracefully ("budget low, asking user").</text>
+</svg>
+<div class="cap">Figure 9. The tool validator cannot tell a legitimate rm from an injected one. The budget doesn't need to: it caps the total damage.</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>14. Concurrency and locking rules</h2>
+<table>
+<tr><th>Rule</th><th>Reason</th></tr>
+<tr><td>Lock order: <code>parent g→lock</code> → <code>child g→lock</code> → <code>tickslock</code></td><td>One global order means no deadlock. clockintr only ever takes tickslock.</td></tr>
+<tr><td>Never sleep holding an inode lock, a buffer, or <code>begin_op</code></td><td><code>charge()</code> may sleep, so all cost peeking finishes and releases first.</td></tr>
+<tr><td>BLOCK uses <code>while</code> + <code>sleep_prepare(&amp;chan); release; sleep(); acquire</code></td><td>This tree's split sleep API. The wakeup can't be lost between release and sleep.</td></tr>
+<tr><td>Check <code>killed(p)</code> after every wakeup</td><td>A blocked process must remain killable. Return −1, charge nothing.</td></tr>
+<tr><td><code>setgroup</code> updates <code>p→gid</code> under <code>p→lock</code>. fork copies it under the parent's lock.</td><td>Hidden test: inheritance across fork and exec.</td></tr>
+<tr><td>Group exit / reuse: reference count of member processes per group</td><td>The nested carve-out is returned exactly once.</td></tr>
+<tr><td>Test at <code>CPUS=1</code> first, then <code>CPUS=3</code></td><td>Hidden test: two groups in parallel on 3 CPUs.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>15. Testing and evidence pipeline</h2>
+<div class="fig">
+<svg viewBox="0 0 760 120" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Arial" font-size="10.5">
+  <defs><marker id="h" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#44546e"/></marker></defs>
+  <rect x="10" y="20" width="120" height="50" rx="6" fill="#f6f3fb" stroke="#8a5cb8"/><text x="70" y="42" text-anchor="middle">run_tests.sh</text><text x="70" y="58" text-anchor="middle" font-size="9">boots QEMU, no human</text>
+  <rect x="160" y="20" width="120" height="50" rx="6" fill="#f6f3fb" stroke="#8a5cb8"/><text x="220" y="42" text-anchor="middle">budgettest</text><text x="220" y="58" text-anchor="middle" font-size="9">prints CSV lines</text>
+  <rect x="310" y="20" width="120" height="50" rx="6" fill="#fff" stroke="#888"/><text x="370" y="42" text-anchor="middle">logs/*.log</text><text x="370" y="58" text-anchor="middle" font-size="9">raw serial output</text>
+  <rect x="460" y="20" width="120" height="50" rx="6" fill="#fff" stroke="#888"/><text x="520" y="42" text-anchor="middle">parse.py</text><text x="520" y="58" text-anchor="middle" font-size="9">→ results/*.csv</text>
+  <rect x="610" y="20" width="140" height="50" rx="6" fill="#eef8f0" stroke="#2f8f4e"/><text x="680" y="42" text-anchor="middle">plot.py → PNG</text><text x="680" y="58" text-anchor="middle" font-size="9">+ PASS/FAIL table</text>
+  <line x1="130" y1="45" x2="158" y2="45" stroke="#44546e" marker-end="url(#h)"/>
+  <line x1="280" y1="45" x2="308" y2="45" stroke="#44546e" marker-end="url(#h)"/>
+  <line x1="430" y1="45" x2="458" y2="45" stroke="#44546e" marker-end="url(#h)"/>
+  <line x1="580" y1="45" x2="608" y2="45" stroke="#44546e" marker-end="url(#h)"/>
+  <text x="10" y="100">Every graph is regenerated from logs. Logs are committed, as the evaluation rule "own run evidence" requires.</text>
+</svg>
+<div class="cap">Figure 10. Unattended harness (Day 14 checkpoint).</div>
+</div>
+
+<table>
+<tr><th>Test</th><th>Checks</th><th>Pass condition</th></tr>
+<tr><td>T1 runaway unlink ×200, FAIL, B=50</td><td>charge before work</td><td>exactly ⌊B/c⌋ deleted, refused = 200 − that</td></tr>
+<tr><td>T2 same, BLOCK</td><td>refill, staircase</td><td>deletions(t) matches formula ±1 step</td></tr>
+<tr><td>T3 fork bomb + unlink in children</td><td>group sharing</td><td>total deletions same as T1</td></tr>
+<tr><td>T4 inheritance across fork + exec</td><td>gid copy</td><td>child and exec'd image report same gid, share budget</td></tr>
+<tr><td>T5 two groups, 3 CPUs, parallel</td><td>per-group locks</td><td>each group's counts match its own hand calculation</td></tr>
+<tr><td>T6 refill while blocked</td><td>while-loop re-check</td><td>blocked proc resumes within 100 ticks of refill</td></tr>
+<tr><td>T7 own-file vs other-file vs console writes, exec foreign</td><td>cost table + creator_gid</td><td>allowed/budget values exact</td></tr>
+<tr><td>T8 creator_gid survives reboot, reused inode reset</td><td>dinode + ialloc</td><td>value correct after restart</td></tr>
+<tr><td>T9 kill a blocked process</td><td>killability</td><td>exits, nothing charged</td></tr>
+<tr><td>T10 usertests</td><td>no regression</td><td>ALL TESTS PASSED (group 0)</td></tr>
+<tr><td>X1–X7 leak and escape attacks</td><td>STRICT</td><td>table of section 10</td></tr>
+<tr><td>X8 starvation: writer loop vs unlink</td><td>fair queue</td><td>max unlink wait: unbounded → bounded</td></tr>
+<tr><td>X9 trash: delete 200, undelete all</td><td>reversibility</td><td>all 200 restored, contents identical</td></tr>
+</table>
+
+<h3>Graphs for the report</h3>
+<ol>
+<li>Required: completed deletions over time, BLOCK vs FAIL, budget 50.</li>
+<li>Unlink max wait time, plain vs fair queue (and writer throughput).</li>
+<li>Wakeups per successful charge vs number of blocked processes (thundering herd).</li>
+<li>Syscall overhead of the gate: ticks for 10 000 cheap syscalls, gate off vs on (shows the cost of peeking).</li>
+<li>Agent demo: files lost vs requested deletions for no budget / FAIL / trash.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2>16. File map and team split</h2>
+<table>
+<tr><th>File</th><th>Change</th><th>Owner</th></tr>
+<tr><td><code>kernel/budget.c</code> (new)</td><td>group table, refill, charge, fair queue, carve-out, audit ring</td><td>A</td></tr>
+<tr><td><code>kernel/budgetparam.h</code> (new)</td><td>team cost table, policy bits</td><td>A</td></tr>
+<tr><td><code>kernel/syscall.c/.h</code>, <code>user/usys.pl</code>, <code>user/user.h</code></td><td>gate hook, new syscall numbers</td><td>A</td></tr>
+<tr><td><code>kernel/proc.c/.h</code></td><td><code>gid</code>, copy on fork, group refcount on exit</td><td>A / D</td></tr>
+<tr><td><code>kernel/sysproc.c</code></td><td>setgroup, setbudget, getbudgetstat, budgetctl</td><td>D</td></tr>
+<tr><td><code>kernel/trap.c</code></td><td>targeted wakeups from clockintr</td><td>A</td></tr>
+<tr><td><code>kernel/fs.h</code>, <code>fs.c</code>, <code>file.h</code>, <code>mkfs/mkfs.c</code></td><td>creator_gid in dinode/inode, ialloc reset</td><td>B</td></tr>
+<tr><td><code>kernel/sysfile.c</code></td><td>cost peek helpers, trash unlink, undelete, purge</td><td>B</td></tr>
+<tr><td><code>user/budgetstat.c</code>, <code>user/budgettest.c</code>, <code>user/leaks/*</code></td><td>tools, harness, attacks</td><td>C</td></tr>
+<tr><td><code>scripts/run_tests.sh</code>, <code>parse.py</code>, <code>plot.py</code>, <code>agent/</code></td><td>host-side harness, graphs, agent + bridge</td><td>C</td></tr>
+<tr><td><code>Makefile</code></td><td>UPROGS</td><td>C</td></tr>
+</table>
+<p>A = budget core, B = filesystem side, C = tests, graphs and agent, D = nested budgets, breaker and report. With 3 members, D's work is split between A and B.</p>
+
+<!-- ============================================================ -->
+<h2>17. Timeline (20 days)</h2>
+<div class="fig">
+<svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Arial" font-size="10">
+  <!-- 20 days, x from 190 to 750 => 28px per day -->
+  <g fill="#555" text-anchor="middle">
+    <text x="204" y="16">1</text><text x="316" y="16">5</text><text x="456" y="16">10</text><text x="596" y="16">15</text><text x="736" y="16">20</text>
+  </g>
+  <g stroke="#eee"><line x1="190" y1="22" x2="190" y2="230"/><line x1="302" y1="22" x2="302" y2="230"/><line x1="470" y1="22" x2="470" y2="230"/><line x1="582" y1="22" x2="582" y2="230"/><line x1="750" y1="22" x2="750" y2="230"/></g>
+  <text x="10" y="40">Read xv6, design doc</text><rect x="190" y="30" width="84" height="14" fill="#9fb4d4"/>
+  <text x="10" y="62">hello syscall (Day 4)</text><rect x="274" y="52" width="28" height="14" fill="#c99a22"/>
+  <text x="10" y="84">Core C1–C7, CPUS=1→3</text><rect x="302" y="74" width="168" height="14" fill="#3b6fb6"/>
+  <text x="10" y="106">Nested, leaks, proportional</text><rect x="414" y="96" width="112" height="14" fill="#2f8f4e"/>
+  <text x="10" y="128">Test harness (Day 14)</text><rect x="470" y="118" width="112" height="14" fill="#8a5cb8"/>
+  <text x="10" y="150">Trash, fair queue, agent</text><rect x="526" y="140" width="112" height="14" fill="#2f8f4e"/>
+  <text x="10" y="172">Measurements, graphs</text><rect x="582" y="162" width="84" height="14" fill="#8a5cb8"/>
+  <text x="10" y="194">Report, viva, zip</text><rect x="666" y="184" width="84" height="14" fill="#9fb4d4"/>
+  <text x="10" y="216">Journal commit</text>
+  <g fill="#333"><circle cx="232" cy="212" r="3"/><circle cx="288" cy="212" r="3"/><circle cx="344" cy="212" r="3"/><circle cx="400" cy="212" r="3"/><circle cx="456" cy="212" r="3"/><circle cx="512" cy="212" r="3"/><circle cx="568" cy="212" r="3"/><circle cx="624" cy="212" r="3"/><circle cx="680" cy="212" r="3"/><circle cx="736" cy="212" r="3"/></g>
+  <text x="190" y="244" fill="#b33">Cut order if behind on Day 10: breaker → herd fix → trash → fair queue. Core and graph 1 are never cut.</text>
+</svg>
+<div class="cap">Figure 11. Plan against the handout checkpoints (Day 4, Day 10, Day 14). One journal commit every 2 days.</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>18. Known limitations (to write honestly in the report)</h2>
+<ul>
+<li><b>Check-then-use gap.</b> The cost is computed from a peek. Between the peek and the real handler, another process could swap the file (for example unlink + recreate with a different creator). We charge the peeked cost. A full fix would charge inside each handler at the point of the inode lock.</li>
+<li><b>The cost table is a policy, not a measurement.</b> "Irreversible" is our model. Console output can't be recalled, but we charge it per call, not per byte.</li>
+<li><b>Disk-fill (L7)</b> is not covered unless the block quota stretch is done.</li>
+<li><b>Trash uses disk space</b> until purge. The quota bounds it, and eviction is charged.</li>
+<li><b>gid 0 is unlimited.</b> Anything running as root is not budgeted. That is a deliberate choice so the system stays usable.</li>
+<li><b>Fair queue</b> adds head-of-line blocking (measured, not hidden).</li>
+<li>No persistence of budgets across reboot. Group state lives in memory, only <code>creator_gid</code> is on disk.</li>
+</ul>
+
+<h2>19. Viva preparation (likely live changes)</h2>
+<table>
+<tr><th>Possible ask</th><th>Where to change</th></tr>
+<tr><td>Change a cost, add a cost for <code>mkdir</code> or <code>link</code></td><td><code>budgetparam.h</code> / <code>syscall_cost()</code> only</td></tr>
+<tr><td>Change the refill period from 100 to 50 ticks</td><td><code>REFILL_PERIOD</code> constant in refill()</td></tr>
+<tr><td>Make FAIL return a different error or log a line</td><td>FAIL branch of <code>charge()</code></td></tr>
+<tr><td>Charge after instead of before (and explain the bug it causes)</td><td>gate in <code>syscall()</code></td></tr>
+<tr><td>Add a per-process counter alongside the group</td><td><code>struct proc</code> + budgetstat</td></tr>
+<tr><td>Make exec reset the group</td><td><code>exec.c</code> (and explain why that is an escape)</td></tr>
+</table>
+<p>Each member should be able to explain: why charge-before, why <code>while</code> not <code>if</code>, why <code>last_refill += periods·100</code>, why group-not-process, and why IPB changed.</p>
+
+<div class="box new"><b>Decisions still open for the team</b>
+<ol>
+<li>Our assigned per-team cost table (it replaces the example numbers here).</li>
+<li>Which extensions we commit to. Proposed: nested budgets + leak audit + proportional cost + trash + fair queue + agent demo.</li>
+<li>Team size and the final split of A/B/C/D.</li>
+</ol></div>
+
+</body>
+</html>
