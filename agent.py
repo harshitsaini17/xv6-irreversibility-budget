@@ -3,8 +3,8 @@
 Two planners:
   * RulePlanner  - deterministic, no LLM. "boot", "ls /", "cat README", "run <cmd>".
                    Used to prove the bridge works, and for repeatable tests.
-  * LLMPlanner   - an LLM behind kiro-gateway (OpenAI-compatible API on
-                   localhost:8000) chooses tools via function calling.
+  * LLMPlanner   - any OpenAI-compatible endpoint (default: local kiro-gateway
+                   on localhost:8000) chooses tools via function calling.
 
 Every step is recorded (request, proposed call, validator verdict, output)
 so the dashboard can show the full trace, as the Agentic-system handout asks.
@@ -16,7 +16,8 @@ import time
 
 from tools import ToolExecutor, openai_tool_schema
 
-GATEWAY_URL = os.environ.get("KIRO_GATEWAY_URL", "http://localhost:8000/v1")
+# Any OpenAI-compatible endpoint works (default: a local kiro-gateway).
+GATEWAY_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
 GATEWAY_ENV = os.environ.get("KIRO_GATEWAY_ENV", "/workspace/proxy/kiro-gateway/.env")
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "claude-sonnet-5.5")
 MAX_STEPS = 8
@@ -32,7 +33,7 @@ Rules:
 
 def _gateway_key():
     """API key for kiro-gateway: env var first, else the gateway's own .env."""
-    key = os.environ.get("KIRO_API_KEY")
+    key = os.environ.get("LLM_API_KEY") or os.environ.get("KIRO_API_KEY")
     if key:
         return key
     try:
@@ -42,7 +43,7 @@ def _gateway_key():
                     return line.split("=", 1)[1].strip().strip("'\"")
     except OSError:
         pass
-    raise RuntimeError("no kiro-gateway key: set KIRO_API_KEY")
+    raise RuntimeError("no LLM key: set LLM_API_KEY")
 
 
 class RulePlanner:

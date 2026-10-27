@@ -20,8 +20,9 @@ import subprocess
 import threading
 import time
 
+# agent/ lives inside the xv6-riscv tree, so the tree is one level up.
 XV6_DIR = os.environ.get(
-    "XV6_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "xv6-riscv")
+    "XV6_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 )
 QEMU = os.environ.get("QEMU", "qemu-system-riscv64")
 PROMPT = "$ "

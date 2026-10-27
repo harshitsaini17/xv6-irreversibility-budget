@@ -98,6 +98,11 @@ async function poll(){
   setTimeout(poll, 1000);
 }
 poll();
+(async () => {
+  const u = new URLSearchParams(location.search);
+  if (u.get('mode')) $('#mode').value = u.get('mode');
+  for (const q of u.getAll('q')) await send(q);
+})();
 </script>
 </body>
 </html>
